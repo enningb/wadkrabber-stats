@@ -1,6 +1,7 @@
 """Streamlit Sail Log app with date slider, map, and daily statistics."""
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -9,7 +10,9 @@ import pandas as pd
 import pydeck as pdk
 import streamlit as st
 
-DATA_FILE =  Path(__file__).parent / "data" / "wadkrabber.csv"
+DATA_FILES: Iterable[Path] = (
+    Path(__file__).parent / "data" / "wadkrabber.csv",
+)
 
 def _prepare_common_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Shared cleanup applied to any dataset variant."""
@@ -99,6 +102,7 @@ def _prepare_wadkrabber_dataset(df: pd.DataFrame) -> pd.DataFrame:
 
     df["wind_speed_knots"] = pd.to_numeric(df.get("TWS"), errors="coerce")
     df["leg_distance_nm"] = pd.to_numeric(df.get("distance"), errors="coerce")
+    df["depth_m"] = pd.to_numeric(df.get("Depth"), errors="coerce")
 
     preferred_location = (
         df.get("havens")
@@ -154,7 +158,7 @@ def _sparkline_frame(day_df: pd.DataFrame, column: str, *, cumulative: bool = Fa
         data[column] = data[column].cumsum()
 
     timestamps = data["timestamp"]
-    if isinstance(data["timestamp"].dtype, pd.DatetimeTZDtype):
+    if pd.api.types.is_datetime64tz_dtype(timestamps):
         timestamps = timestamps.dt.tz_convert(None)
 
     result = data.copy()
@@ -164,7 +168,7 @@ def _sparkline_frame(day_df: pd.DataFrame, column: str, *, cumulative: bool = Fa
     return result
 
 
-def _load_dataset(path: Path ) -> pd.DataFrame:
+def _load_dataset(path: Path) -> pd.DataFrame:
     """Load and preprocess whichever dataset is provided."""
     df = pd.read_csv(path)
     df = _prepare_common_columns(df)
@@ -180,13 +184,22 @@ def _load_dataset(path: Path ) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def load_data(path: Path = DATA_FILE) -> pd.DataFrame:
+def load_data(path: Optional[Path] = None) -> pd.DataFrame:
     """Cached loader that wraps preprocessing with error handling."""
     if path is not None:
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"Could not find sail log data at '{path}'.")
         return _load_dataset(path)
+
+    for candidate in DATA_FILES:
+        if candidate.exists():
+            return _load_dataset(candidate)
+
+    search_hint = " or ".join(str(p) for p in DATA_FILES)
+    raise FileNotFoundError(
+        f"Could not find sail log data. Place a CSV at {search_hint}."
+    )
 
 
 def daily_summary(day_df: pd.DataFrame) -> Dict[str, float | str]:
@@ -249,7 +262,7 @@ def route_layers(day_df: pd.DataFrame) -> List[pdk.Layer]:
 
     route_layer = pdk.Layer(
         "PathLayer",
-        route_data,
+        data=route_data,
         get_path="path",
         get_color=[16, 127, 201],
         width_scale=10,
@@ -259,7 +272,7 @@ def route_layers(day_df: pd.DataFrame) -> List[pdk.Layer]:
 
     points_layer = pdk.Layer(
         "ScatterplotLayer",
-        day_df,
+        data=day_df[['longitude', 'latitude']],
         get_position="[longitude, latitude]",
         get_color="[255, 140, 0]",
         get_radius=150,
@@ -275,7 +288,7 @@ def center_view(day_df: pd.DataFrame) -> pdk.ViewState:
     lat = float(day_df["latitude"].mean())
     lon = float(day_df["longitude"].mean())
 
-    zoom = 8
+    zoom = 11
     if "zoom_hint" in day_df.columns and day_df["zoom_hint"].notna().any():
         zoom = float(day_df["zoom_hint"].dropna().iloc[-1])
 
@@ -342,7 +355,177 @@ def render_stats(stats: Dict[str, float | str], day_df: pd.DataFrame) -> None:
                 cumulative=bool(source_details.get("cumulative")),
             )
             if sparkline_df is not None and not sparkline_df.empty:
-                col.line_chart(sparkline_df, height=90)
+                col.line_chart(sparkline_df, height=90, width='content')
+
+
+def _format_metric_value(value: float, suffix: str) -> str:
+    return f"{value:.1f} {suffix}" if value is not None else "—"
+
+
+def compute_overall_stats(df: pd.DataFrame) -> Dict[str, object]:
+    """Aggregate dataset-wide statistics for the overview page."""
+    metrics: Dict[str, object] = {}
+
+    depth_col = df.get("depth_m")
+    if depth_col is not None:
+        depth_values = depth_col.dropna()
+        if not depth_values.empty:
+            idx = depth_values.idxmax()
+            record = df.loc[idx]
+            metrics["deepest_water"] = {
+                "value": float(depth_values.loc[idx]),
+                "context": record.get("location")
+                or record.get("start_harbour")
+                or record.get("vertrekhaven")
+                or "Unknown location",
+                "timestamp": record.get("timestamp_label", ""),
+            }
+
+    wind_col = df.get("wind_speed_knots")
+    if wind_col is not None:
+        wind_values = wind_col.dropna()
+        if not wind_values.empty:
+            idx = wind_values.idxmax()
+            record = df.loc[idx]
+            metrics["hardest_wind"] = {
+                "value": float(wind_values.loc[idx]),
+                "context": record.get("location")
+                or record.get("end_harbour")
+                or record.get("aankomsthaven")
+                or "At sea",
+                "timestamp": record.get("timestamp_label", ""),
+            }
+
+    speed_col = df.get("speed_knots")
+    if speed_col is not None:
+        speed_values = speed_col.dropna()
+        if not speed_values.empty:
+            idx = speed_values.idxmax()
+            record = df.loc[idx]
+            metrics["fastest_speed"] = {
+                "value": float(speed_values.loc[idx]),
+                "context": record.get("location")
+                or record.get("start_harbour")
+                or record.get("vertrekhaven")
+                or "Underway",
+                "timestamp": record.get("timestamp_label", ""),
+            }
+
+    harbour_counter: Counter[str] = Counter()
+    trip_rows: List[Dict[str, object]] = []
+
+    for sailing_date, day_df in df.groupby("date"):
+        if day_df.empty:
+            continue
+
+        summary = daily_summary(day_df)
+        distance_nm = summary.get("distance_nm")
+        start_series = (
+            day_df["start_harbour"]
+            if "start_harbour" in day_df.columns
+            else day_df.get("vertrekhaven")
+        )
+        end_series = (
+            day_df["end_harbour"]
+            if "end_harbour" in day_df.columns
+            else day_df.get("aankomsthaven")
+        )
+        start_label = _select_first(start_series) if start_series is not None else None
+        end_label = _select_last(end_series) if end_series is not None else None
+
+        if start_label:
+            harbour_counter[start_label] += 1
+        if end_label:
+            harbour_counter[end_label] += 1
+
+        if distance_nm is not None:
+            trip_rows.append(
+                {
+                    "date": sailing_date,
+                    "distance_nm": float(distance_nm),
+                    "start_harbour": start_label or "—",
+                    "end_harbour": end_label or "—",
+                }
+            )
+
+    trips_df = pd.DataFrame(trip_rows)
+    if not trips_df.empty:
+        longest_trip = trips_df.sort_values("distance_nm", ascending=False).iloc[0]
+        metrics["longest_trip"] = longest_trip
+        metrics["trip_table"] = trips_df.sort_values("date", ascending=True)
+
+    if harbour_counter:
+        harbour_df = pd.DataFrame(
+            [
+                {"harbour": harbour, "visits": visits}
+                for harbour, visits in harbour_counter.most_common(10)
+            ]
+        )
+        metrics["harbour_counts"] = harbour_df
+
+    return metrics
+
+
+def render_overall_statistics(df: pd.DataFrame) -> None:
+    """Render the overall statistics page."""
+    stats = compute_overall_stats(df)
+
+    headline_cols = st.columns(3)
+    deepest = stats.get("deepest_water")
+    if deepest:
+        headline_cols[0].metric(
+            "Deepest Water",
+            _format_metric_value(deepest["value"], "m"),
+            deepest.get("context", ""),
+        )
+        if deepest.get("timestamp"):
+            headline_cols[0].caption(deepest["timestamp"])
+
+    hardest = stats.get("hardest_wind")
+    if hardest:
+        headline_cols[1].metric(
+            "Hardest Wind",
+            _format_metric_value(hardest["value"], "kn"),
+            hardest.get("context", ""),
+        )
+        if hardest.get("timestamp"):
+            headline_cols[1].caption(hardest["timestamp"])
+
+    fastest = stats.get("fastest_speed")
+    if fastest:
+        headline_cols[2].metric(
+            "Fastest Boat Speed",
+            _format_metric_value(fastest["value"], "kn"),
+            fastest.get("context", ""),
+        )
+        if fastest.get("timestamp"):
+            headline_cols[2].caption(fastest["timestamp"])
+
+    longest_trip = stats.get("longest_trip")
+    if longest_trip is not None:
+        st.subheader("Longest Trip")
+        st.write(
+            f"{longest_trip['date']} — {longest_trip['start_harbour']} → {longest_trip['end_harbour']}"
+        )
+        st.metric("Distance", f"{longest_trip['distance_nm']:.1f} nm")
+
+    trip_table = stats.get("trip_table")
+    if isinstance(trip_table, pd.DataFrame) and not trip_table.empty:
+        display_df = trip_table.assign(
+            date=lambda d: d["date"].astype(str),
+            distance_nm=lambda d: d["distance_nm"].map(lambda val: f"{val:.1f}"),
+        )
+        st.subheader("Trips By Day")
+        st.dataframe(display_df, width='content', hide_index=True)
+
+    harbour_counts = stats.get("harbour_counts")
+    if isinstance(harbour_counts, pd.DataFrame) and not harbour_counts.empty:
+        st.subheader("Most Visited Harbours")
+        st.bar_chart(
+            harbour_counts.set_index("harbour"),
+            width='content',
+        )
+        st.dataframe(harbour_counts, hide_index=True, width='content')
 
 
 def main() -> None:
@@ -359,7 +542,18 @@ def main() -> None:
         st.error(f"Failed to parse sail log data: {exc}")
         st.stop()
 
+    view = st.sidebar.radio(
+        "Navigation",
+        ("Daily Explorer", "Overall Statistics"),
+    )
+
+    if view == "Overall Statistics":
+        st.header("Overall Statistics")
+        render_overall_statistics(df)
+        return
+
     available_dates = sorted(df["date"].unique())
+    
     if not available_dates:
         st.warning("No sail log entries available yet.")
         st.stop()
@@ -379,15 +573,14 @@ def main() -> None:
         st.stop()
 
     day_label = selected_date.strftime("%B %d, %Y")
-    st.subheader(f"Daily Overview — {day_label}")
+    start_haven = day_df.vertrekhaven.iloc[0]
+    aankomst_haven = day_df.aankomsthaven.iloc[0]
+    st.subheader(f"Van {start_haven} naar {aankomst_haven} op {day_label}")
 
-    #render_map(day_df)
-    st.map(day_df)
+    render_map(day_df)
     st.subheader("Daily Statistics")
     stats = daily_summary(day_df)
     render_stats(stats, day_df)
-
-    
 
     with st.expander("Show raw log entries"):
         display_columns = [

@@ -1,6 +1,6 @@
 # Wadkrabber Sail Log
 
-Interactive Streamlit app to explore sailing routes day by day. Use the date slider to switch between voyages, view each day's track on an interactive map, and review daily statistics (now with inline sparklines for speed, wind, and distance trends) pulled from your logbook.
+Interactive Streamlit app to explore sailing routes day by day. Use the date slider to switch between voyages, view each day's track on an interactive map, review daily statistics (with inline sparklines for speed, wind, and distance trends), or jump to the overall statistics page for fleet-wide records.
 
 ## Getting started
 
@@ -30,6 +30,7 @@ In both cases, the CSV should contain one row per position fix (or event). Any a
 
 - Drop your own logbook export in `data/wadkrabber.csv` (or `data/sail_log.csv` if you prefer the generic schema); keep headers identical.
 - Adjust the `daily_summary` function in `app.py` if you track different metrics.
-- To change the map styling or layers, edit `render_map` in `app.py`.
+- To change the map styling or layers, edit `render_map` in `app.py` (it defaults to a Carto basemap and falls back to `st.map` if pydeck cannot render).
+- Tweak the overall statistics shown in the sidebar's "Overall Statistics" page by updating `compute_overall_stats` in `app.py`.
 
 Happy sailing!
