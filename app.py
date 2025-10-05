@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 import pandas as pd
+import numpy as np
 import pydeck as pdk
 import streamlit as st
 
@@ -96,9 +97,18 @@ def _prepare_wadkrabber_dataset(df: pd.DataFrame) -> pd.DataFrame:
 
     df["timestamp_label"] = df["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
 
-    speed = pd.to_numeric(df.get("SOG"), errors="coerce")
-    fallback_speed = pd.to_numeric(df.get("STW"), errors="coerce")
-    df["speed_knots"] = speed.fillna(fallback_speed)
+    speed_sog_knots = pd.to_numeric(df.get("SOG"), errors="coerce")
+    speed_stw_knots = pd.to_numeric(df.get("STW"), errors="coerce")
+    df["speed_knots"] = speed_sog_knots
+    df["speed_knots"].replace(0,np.nan, inplace=True)
+    df["speed_stw_knots"] = speed_stw_knots
+    df["speed_stw_knots"].replace(0, np.nan, inplace=True)
+    df["current_speed_knots"] = df['speed_knots'] - df['speed_stw_knots']
+
+    wind_angle_awa = pd.to_numeric(df.get("AWA"), errors="coerce")
+    wind_angle_twa = pd.to_numeric(df.get("TWA"), errors="coerce")
+    df["wind_angle_awa"] = wind_angle_awa
+    df["wind_angle_twa"] = wind_angle_twa
 
     df["wind_speed_knots"] = pd.to_numeric(df.get("TWS"), errors="coerce")
     df["leg_distance_nm"] = pd.to_numeric(df.get("distance"), errors="coerce")
@@ -229,6 +239,13 @@ def daily_summary(day_df: pd.DataFrame) -> Dict[str, float | str]:
     if "sea_state" in day_df.columns and day_df["sea_state"].notna().any():
         stats["sea_state"] = day_df["sea_state"].dropna().iloc[-1]
 
+    if "current_speed_knots" in day_df.columns:
+        current = day_df["current_speed_knots"].dropna()
+        if not current.empty:
+            stats["avg_current_speed_knots"] = float(current.mean())
+            stats["max_current_speed_knots"] = float(current.max())
+            stats["min_current_speed_knots"] = float(current.min())
+
     if "notes" in day_df.columns:
         note_value = _select_last(day_df["notes"])
         if note_value:
@@ -274,10 +291,10 @@ def route_layers(day_df: pd.DataFrame) -> List[pdk.Layer]:
         "ScatterplotLayer",
         data=day_df[['longitude', 'latitude']],
         get_position="[longitude, latitude]",
-        get_color="[255, 140, 0]",
-        get_radius=150,
+        get_color="[16, 127, 201]",
+        get_radius=20,
         pickable=True,
-        get_fill_color="[255, 140, 0]",
+        get_fill_color="[16, 127, 201]",
     )
 
     return [route_layer, points_layer]
@@ -355,7 +372,7 @@ def render_stats(stats: Dict[str, float | str], day_df: pd.DataFrame) -> None:
                 cumulative=bool(source_details.get("cumulative")),
             )
             if sparkline_df is not None and not sparkline_df.empty:
-                col.line_chart(sparkline_df, height=90, width='content')
+                col.line_chart(sparkline_df, height=90, width=200)
 
 
 def _format_metric_value(value: float, suffix: str) -> str:
@@ -527,6 +544,21 @@ def render_overall_statistics(df: pd.DataFrame) -> None:
         )
         st.dataframe(harbour_counts, hide_index=True, width='content')
 
+    st.scatter_chart(
+            df,
+            x="AWA",
+            y="speed_knots",
+            color="AWS",
+#            size="col3",
+        )
+    st.scatter_chart(
+            df,
+            x="AWS",
+            y="speed_knots",
+            color="AWS",
+#            size="col3",
+        )
+
 
 def main() -> None:
     st.set_page_config(page_title="Sail Log", layout="wide")
@@ -596,6 +628,8 @@ def main() -> None:
         existing_columns = [c for c in display_columns if c in day_df.columns]
         st.dataframe(day_df[existing_columns])
 
+    with st.expander("Show raw ALL log entries"):
+        st.dataframe(day_df)
 
 if __name__ == "__main__":
     main()
